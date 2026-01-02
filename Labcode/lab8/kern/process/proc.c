@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <fs.h>
 #include <vfs.h>
+#include <file.h>
 #include <sysfile.h>
 /* ------------- process/thread mechanism design&implementation -------------
 (an simplified Linux process/thread mechanism )
@@ -107,6 +108,21 @@ alloc_proc(void)
          *       uint32_t flags;                             // Process flag
          *       char name[PROC_NAME_LEN + 1];               // Process name
          */
+        proc->state = PROC_UNINIT;
+        proc->pid = -1;
+        proc->runs = 0;
+        proc->kstack = 0;
+        proc->need_resched = 0;
+        proc->parent = NULL;
+        proc->mm = NULL;
+        memset(&(proc->context), 0, sizeof(struct context));
+        proc->tf = NULL;
+        proc->pgdir = boot_pgdir_pa;
+        proc->flags = 0;
+        memset(proc->name, 0, sizeof(proc->name));
+        list_init(&(proc->list_link));
+        list_init(&(proc->hash_link));
+        proc->exit_code = 0;
 
         // LAB5:填写你在lab5中实现的代码 (update LAB4 steps)已填写
         /*
@@ -114,6 +130,10 @@ alloc_proc(void)
          *       uint32_t wait_state;                        // waiting state
          *       struct proc_struct *cptr, *yptr, *optr;     // relations between processes
          */
+        proc->wait_state = 0;
+        proc->cptr = NULL;
+        proc->yptr = NULL;
+        proc->optr = NULL;
 
         // LAB6:填写你在lab6中实现的代码 (update LAB5 steps)已填写
         /*
@@ -153,7 +173,7 @@ alloc_proc(void)
         proc->lab6_stride = 0;
         proc->lab6_priority = 0;
 
-        
+        proc->filesp = NULL;
     }
     return proc;
 }
@@ -265,6 +285,21 @@ void proc_run(struct proc_struct *proc)
         *   lcr3():                   Modify the value of CR3 register
         *   switch_to():              Context switching between two processes
         */
+        if (proc != current)
+    { 
+        bool intr_flag;
+        local_intr_save(intr_flag);
+        {
+            struct proc_struct *prev = current;
+            current = proc;
+
+            lsatp(proc->pgdir);
+            flush_tlb();
+            switch_to(&(prev->context), &(proc->context));
+        }
+        local_intr_restore(intr_flag);
+    }
+
     //LAB8 YOUR CODE : (update LAB4 steps)
       /*
        * below fields(add in LAB6) in proc_struct need to be initialized
@@ -522,6 +557,56 @@ int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
      *   proc_list:    the process set's list
      *   nr_process:   the number of process set
      */
+     // 1. 分配进程结构
+    if ((proc = alloc_proc()) == NULL)
+    {
+        goto fork_out;
+    }
+    
+    // 2. 设置父进程指针（在临界区内）
+    bool intr_flag;
+    local_intr_save(intr_flag);
+    {
+        proc->parent = current;
+    }
+    local_intr_restore(intr_flag);
+
+    // 3. 分配内核栈
+    if (setup_kstack(proc) != 0)
+    {
+        goto bad_fork_cleanup_proc;
+    }
+    
+    // 4. 拷贝或共享内存空间
+    if (copy_mm(clone_flags, proc) != 0)
+    {
+        goto bad_fork_cleanup_kstack;
+    }
+    
+    // 5. 拷贝线程上下文
+    copy_thread(proc, stack, tf);
+    
+    // 6. LAB8: 拷贝或共享文件系统 
+    if (copy_files(clone_flags, proc) != 0)
+    {
+        goto bad_fork_cleanup_fs;
+    }
+
+    // 7. 分配 PID 并加入进程链表（在临界区内）
+    local_intr_save(intr_flag);
+    {
+        proc->pid = get_pid();
+        hash_proc(proc);
+        set_links(proc);
+    }
+    local_intr_restore(intr_flag);
+
+    // 8. 唤醒新进程
+    wakeup_proc(proc);
+    
+    // 9. 返回子进程的 PID
+    ret = proc->pid;
+   
 
     //    1. call alloc_proc to allocate a proc_struct
     //    2. call setup_kstack to allocate a kernel stack for child process
@@ -538,11 +623,6 @@ int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
      *    update step 1: set child proc's parent to current process, make sure current process's wait_state is 0
      *    update step 5: insert proc_struct into hash_list && proc_list, set the relation links of process
      */
-    
-    if (copy_files(clone_flags, proc) != 0)
-    { // for LAB8
-        goto bad_fork_cleanup_kstack;
-    }
     
 fork_out:
     return ret;
@@ -636,6 +716,32 @@ load_icode_read(int fd, void *buf, size_t len, off_t offset)
     return 0;
 }
 
+static int
+user_mem_store_bytes(pde_t *pgdir, uintptr_t uva, const void *src, size_t len)
+{
+    const unsigned char *kbuf = (const unsigned char *)src;
+    size_t copied = 0;
+    while (copied < len)
+    {
+        uintptr_t curr = uva + copied;
+        pte_t *ptep = get_pte(pgdir, curr, 0);
+        if (ptep == NULL || !(*ptep & PTE_V))
+        {
+            return -E_INVAL;
+        }
+        struct Page *page = pte2page(*ptep);
+        size_t off = curr & (PGSIZE - 1);
+        size_t nbytes = PGSIZE - off;
+        if (nbytes > len - copied)
+        {
+            nbytes = len - copied;
+        }
+        memcpy((unsigned char *)page2kva(page) + off, kbuf + copied, nbytes);
+        copied += nbytes;
+    }
+    return 0;
+}
+
 // load_icode -  called by sys_exec-->do_execve
 
 static int
@@ -666,9 +772,265 @@ load_icode(int fd, int argc, char **kargv)
      * (7) setup trapframe for user environment
      * (8) if up steps failed, you should cleanup the env.
      */
+    assert(argc >= 0 && argc <= EXEC_MAX_ARG_NUM);
     
-}
+    if (current->mm != NULL)
+    {
+        panic("load_icode: current->mm must be empty.\n");
+    }
 
+    int ret = -E_NO_MEM;
+    struct mm_struct *mm;
+    struct Page*page;
+    
+    // (1) 创建新的 mm 结构
+    if ((mm = mm_create()) == NULL)
+    {
+        goto bad_mm;
+    }
+    
+    // (2) 创建新的页目录表
+    if (setup_pgdir(mm) != 0)
+    {
+        goto bad_pgdir_cleanup_mm;
+    }
+
+    // (3) 读取 ELF 头
+    struct elfhdr __elf, *elf = &__elf;
+    if ((ret = load_icode_read(fd, elf, sizeof(struct elfhdr), 0)) != 0)
+    {
+        goto bad_elf_cleanup_pgdir;
+    }
+
+    // (4) 检查 ELF 魔数
+    if (elf->e_magic != ELF_MAGIC)
+    {
+        ret = -E_INVAL_ELF;
+        goto bad_elf_cleanup_pgdir;
+    }
+
+    struct proghdr __ph, *ph = &__ph;
+    uint32_t vm_flags, perm, phnum;
+    
+    // (5) 遍历所有程序段
+    for (phnum = 0; phnum < elf->e_phnum; phnum++)
+    {
+        off_t phoff = elf->e_phoff + sizeof(struct proghdr) * phnum;
+        
+        // 读取段头
+        if ((ret = load_icode_read(fd, ph, sizeof(struct proghdr), phoff)) != 0)
+        {
+            goto bad_cleanup_mmap;
+        }
+        
+        // 只处理 LOAD 类型的段
+        if (ph->p_type != ELF_PT_LOAD)
+        {
+            continue;
+        }
+        if (ph->p_filesz > ph->p_memsz)
+        {
+            ret = -E_INVAL_ELF;
+            goto bad_cleanup_mmap;
+        }
+        if (ph->p_memsz == 0)
+        {
+            continue;
+        }
+        
+// 设置虚拟内存标志和页表权限
+vm_flags = 0;
+perm = PTE_U | PTE_V;
+
+if (ph->p_flags & ELF_PF_R) {
+    vm_flags |= VM_READ;
+    perm |= PTE_R;  // ⭐ 添加读权限
+}
+if (ph->p_flags & ELF_PF_W) {
+    vm_flags |= VM_WRITE;
+    perm |= (PTE_R | PTE_W);  // ⭐ 可写必须可读
+}
+if (ph->p_flags & ELF_PF_X) {
+    vm_flags |= VM_EXEC;
+    perm |= PTE_X;  // ⭐ 添加执行权限
+}
+        
+        // 建立虚拟内存映射
+        if ((ret = mm_map(mm, ph->p_va, ph->p_memsz, vm_flags, NULL)) != 0)
+        {
+            goto bad_cleanup_mmap;
+        }
+        
+        // 分配物理页并加载段数据
+        size_t off, size;
+        uintptr_t start = ph->p_va, end, la = ROUNDDOWN(start, PGSIZE);
+        
+        ret = -E_NO_MEM;
+        end = ph->p_va + ph->p_filesz;
+        
+        // 逐页加载
+        while (start < end)
+        {
+            if ((page = pgdir_alloc_page(mm->pgdir, la, perm)) == NULL)
+            {
+                goto bad_cleanup_mmap;
+            }
+            off = start - la, size = PGSIZE - off, la += PGSIZE;
+            if (end < la)
+            {
+                size -= la - end;
+            }
+            
+            // 从文件读取数据
+            if ((ret = load_icode_read(fd, page2kva(page) + off, size, 
+                                       ph->p_offset + (start - ph->p_va))) != 0)
+            {
+                goto bad_cleanup_mmap;
+            }
+            start += size;
+        }
+        
+        // 处理 BSS 段（memsz > filesz 的部分）
+        end = ph->p_va + ph->p_memsz;
+        if (start < la)
+        {
+            // 清零当前页的剩余部分
+            if (start == end)
+            {
+                continue;
+            }
+            off = start + PGSIZE - la, size = PGSIZE - off;
+            if (end < la)
+            {
+                size -= la - end;
+            }
+            memset(page2kva(page) + off, 0, size);
+            start += size;
+            assert((end < la && start == end) || (end >= la && start == la));
+        }
+        
+        // 继续分配 BSS 段的页
+        while (start < end)
+        {
+            if ((page = pgdir_alloc_page(mm->pgdir, la, perm)) == NULL)
+            {
+                goto bad_cleanup_mmap;
+            }
+            off = start - la, size = PGSIZE - off, la += PGSIZE;
+            if (end < la)
+            {
+                size -= la - end;
+            }
+            memset(page2kva(page) + off, 0, size);
+            start += size;
+        }
+    }
+    
+    // 关闭 ELF 文件
+    file_close(fd);
+
+    // (6) 创建用户栈
+    vm_flags = VM_READ | VM_WRITE | VM_STACK;
+    if ((ret = mm_map(mm, USTACKTOP - USTACKSIZE, USTACKSIZE, vm_flags, NULL)) != 0)
+    {
+        goto bad_cleanup_mmap;
+    }
+
+    // 只预先分配栈顶的若干页，剩余页按需分配
+    for (uint32_t n = 1; n <= 8; n++)
+    {
+        assert(pgdir_alloc_page(mm->pgdir, USTACKTOP - n * PGSIZE,
+                                PTE_U | PTE_R | PTE_W | PTE_V) != NULL);
+    }
+
+    uint32_t argv_size = 0;
+    for (uint32_t idx = 0; idx < (uint32_t)argc; idx++)
+    {
+        argv_size += strnlen(kargv[idx], EXEC_MAX_ARG_LEN + 1) + 1;
+    }
+
+    uintptr_t strings_top = USTACKTOP - ROUNDUP(argv_size, sizeof(uintptr_t));
+    char **uargv = (char **)(strings_top - (uintptr_t)(argc + 1) * sizeof(char *));
+    uintptr_t sp_aligned = ROUNDDOWN((uintptr_t)uargv, 16);
+    uintptr_t argv_ptr_uva = sp_aligned - sizeof(uintptr_t);
+    uintptr_t argc_uva = argv_ptr_uva - sizeof(uintptr_t);
+
+    if (argc_uva < USTACKTOP - USTACKSIZE)
+    {
+        ret = -E_NO_MEM;
+        goto bad_cleanup_mmap;
+    }
+
+    uintptr_t arg_uva = strings_top;
+    for (uint32_t idx = 0; idx < (uint32_t)argc; idx++)
+    {
+        size_t len = strnlen(kargv[idx], EXEC_MAX_ARG_LEN + 1) + 1;
+        if ((ret = user_mem_store_bytes(mm->pgdir, arg_uva, kargv[idx], len)) != 0)
+        {
+            goto bad_cleanup_mmap;
+        }
+
+        uintptr_t ptr_uva = (uintptr_t)&uargv[idx];
+        if ((ret = user_mem_store_bytes(mm->pgdir, ptr_uva, &arg_uva, sizeof(arg_uva))) != 0)
+        {
+            goto bad_cleanup_mmap;
+        }
+        arg_uva += len;
+    }
+
+    uintptr_t null_ptr = 0;
+    if ((ret = user_mem_store_bytes(mm->pgdir, (uintptr_t)&uargv[argc], &null_ptr, sizeof(null_ptr))) != 0)
+    {
+        goto bad_cleanup_mmap;
+    }
+
+    uintptr_t argc_value = (uintptr_t)argc;
+    if ((ret = user_mem_store_bytes(mm->pgdir, argc_uva, &argc_value, sizeof(argc_value))) != 0)
+    {
+        goto bad_cleanup_mmap;
+    }
+
+    uintptr_t uargv_value = (uintptr_t)uargv;
+    if ((ret = user_mem_store_bytes(mm->pgdir, argv_ptr_uva, &uargv_value, sizeof(uargv_value))) != 0)
+    {
+        goto bad_cleanup_mmap;
+    }
+
+    uintptr_t user_sp = argc_uva;
+
+    // (8) 设置 mm 和切换页表
+    mm_count_inc(mm);
+    current->mm = mm;
+    current->pgdir = PADDR(mm->pgdir);
+    lsatp(PADDR(mm->pgdir));
+    flush_tlb();
+
+
+    
+    // (9) 设置中断帧
+    struct trapframe *tf = current->tf;
+    memset(tf, 0, sizeof(struct trapframe));
+    tf->gpr.sp = user_sp;
+    tf->gpr.a0 = argc;
+    tf->gpr.a1 = (uintptr_t)uargv;
+    tf->gpr.a2 = 0;
+    tf->epc = elf->e_entry;
+    tf->status = (read_csr(sstatus) | SSTATUS_SPIE) & ~SSTATUS_SPP;
+    
+    ret = 0;
+
+out:
+    return ret;
+    
+bad_cleanup_mmap:
+    exit_mmap(mm);
+bad_elf_cleanup_pgdir:
+    put_pgdir(mm);
+bad_pgdir_cleanup_mm:
+    mm_destroy(mm);
+bad_mm:
+    goto out;
+}
 // this function isn't very correct in LAB8
 static void
 put_kargv(int argc, char **kargv)
@@ -716,6 +1078,9 @@ int do_execve(const char *name, int argc, const char **argv)
 {
     static_assert(EXEC_MAX_ARG_LEN >= FS_MAX_FPATH_LEN);
     struct mm_struct *mm = current->mm;
+    
+    cprintf("do_execve: start, name=%s, argc=%d\n", name, argc);  // ⭐ 添加
+    
     if (!(argc >= 1 && argc <= EXEC_MAX_ARG_NUM))
     {
         return -E_INVAL;
@@ -738,27 +1103,36 @@ int do_execve(const char *name, int argc, const char **argv)
     {
         if (!copy_string(mm, local_name, name, sizeof(local_name)))
         {
+            cprintf("do_execve: copy_string failed\n");  // ⭐ 添加
             unlock_mm(mm);
             return ret;
         }
     }
     if ((ret = copy_kargv(mm, argc, kargv, argv)) != 0)
     {
+        cprintf("do_execve: copy_kargv failed, ret=%d\n", ret);  // ⭐ 添加
         unlock_mm(mm);
         return ret;
     }
-    path = argv[0];
     unlock_mm(mm);
-    files_closeall(current->filesp);
+
+    path = kargv[0];
+
+    cprintf("do_execve: path=%s\n", path);  // ⭐ 添加
 
     /* sysfile_open will check the first argument path, thus we have to use a user-space pointer, and argv[0] may be incorrect */
     int fd;
-    if ((ret = fd = sysfile_open(path, O_RDONLY)) < 0)
+    if ((ret = fd = file_open((char *)path, O_RDONLY)) < 0)
     {
+        cprintf("do_execve: file_open failed, ret=%d\n", ret);  // ⭐ 添加
         goto execve_exit;
     }
+
+    cprintf("do_execve: file_open success, fd=%d\n", fd);  // ⭐ 添加
+    
     if (mm != NULL)
     {
+        cprintf("do_execve: cleaning old mm\n");  // ⭐ 添加
         lsatp(boot_pgdir_pa);
         if (mm_count_dec(mm) == 0)
         {
@@ -768,17 +1142,24 @@ int do_execve(const char *name, int argc, const char **argv)
         }
         current->mm = NULL;
     }
+    
+    cprintf("do_execve: calling load_icode, fd=%d\n", fd);  // ⭐ 添加
+    
     ret = -E_NO_MEM;
-    ;
     if ((ret = load_icode(fd, argc, kargv)) != 0)
     {
+        cprintf("do_execve: load_icode failed, ret=%d\n", ret);  // ⭐ 添加
         goto execve_exit;
     }
+    
     put_kargv(argc, kargv);
     set_proc_name(current, local_name);
+    
+    cprintf("do_execve: success\n");  // ⭐ 添加
     return 0;
 
 execve_exit:
+    cprintf("do_execve: execve_exit, ret=%d\n", ret);  // ⭐ 添加
     put_kargv(argc, kargv);
     do_exit(ret);
     panic("already exit: %e.\n", ret);
@@ -915,7 +1296,7 @@ kernel_execve(const char *name, const char **argv)
     kernel_execve(name, argv);                           \
 })
 
-#define KERNEL_EXECVE(x, ...) __KERNEL_EXECVE(#x, #x, ##__VA_ARGS__)
+#define KERNEL_EXECVE(x, ...) __KERNEL_EXECVE(#x, "/" #x, ##__VA_ARGS__)
 
 #define KERNEL_EXECVE2(x, ...) KERNEL_EXECVE(x, ##__VA_ARGS__)
 
@@ -948,6 +1329,19 @@ init_main(void *arg)
     {
         panic("set boot fs failed: %e.\n", ret);
     }
+    
+    int fd0, fd1, fd2;
+    fd0 = sysfile_open("stdin:", O_RDONLY);
+    fd1 = sysfile_open("stdout:", O_WRONLY);
+    fd2 = sysfile_open("stdout:", O_WRONLY);
+    
+    cprintf("init_main: opened stdin/stdout/stderr, fd0=%d, fd1=%d, fd2=%d\n", fd0, fd1, fd2);
+    
+    if (fd0 != 0 || fd1 != 1 || fd2 != 2)
+    {
+        panic("failed to open stdin/stdout/stderr, got fd0=%d, fd1=%d, fd2=%d.\n", fd0, fd1, fd2);
+    }
+    
     size_t nr_free_pages_store = nr_free_pages();
     size_t kernel_allocated_store = kallocated();
 
@@ -957,7 +1351,6 @@ init_main(void *arg)
         panic("create user_main failed.\n");
     }
     extern void check_sync(void);
-    // check_sync();                // check philosopher sync problem
 
     while (do_wait(0, NULL) == 0)
     {
@@ -1009,7 +1402,7 @@ void proc_init(void)
 
     current = idleproc;
 
-    int pid = kernel_thread(init_main, NULL, 0);
+    int pid = kernel_thread(init_main, NULL, CLONE_FS);
     if (pid <= 0)
     {
         panic("create init_main failed.\n");

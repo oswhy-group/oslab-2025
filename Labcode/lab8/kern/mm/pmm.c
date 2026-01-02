@@ -216,8 +216,8 @@ switch_kernel_memorylayout()
         bootstack[-PGSIZE] = 0;
 
         // set pages beneath and above the kernel stack as guardians
-        boot_map_segment(boot_pgdir_va, bootstackguard, PGSIZE, PADDR(bootstackguard), 0);
-        boot_map_segment(boot_pgdir_va, boot_page_table_sv39, PGSIZE, PADDR(boot_page_table_sv39), 0);
+        boot_map_segment(boot_pgdir_va, (uintptr_t)bootstackguard, PGSIZE, PADDR(bootstackguard), 0);
+        boot_map_segment(boot_pgdir_va, (uintptr_t)boot_page_table_sv39, PGSIZE, PADDR(boot_page_table_sv39), 0);
         flush_tlb();
 
         // the following four statements should all crash
@@ -480,6 +480,14 @@ int copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end,
              * (3) memory copy from src_kvaddr to dst_kvaddr, size is PGSIZE
              * (4) build the map of phy addr of  nage with the linear addr start
              */
+              // (1) find src_kvaddr: the kernel virtual address of page
+            void *src_kvaddr = page2kva(page);
+            // (2) find dst_kvaddr: the kernel virtual address of npage
+            void *dst_kvaddr = page2kva(npage);
+            // (3) memory copy from src_kvaddr to dst_kvaddr, size is PGSIZE
+            memcpy(dst_kvaddr, src_kvaddr, PGSIZE);
+            // (4) build the map of phy addr of npage with the linear addr start
+            ret = page_insert(to, npage, start, perm);
             
             assert(ret == 0);
         }

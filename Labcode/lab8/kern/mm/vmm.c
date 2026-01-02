@@ -254,6 +254,61 @@ bool copy_from_user(struct mm_struct *mm, void *dst, const void *src, size_t len
     return 1;
 }
 
+int do_pgfault(struct mm_struct *mm, uint32_t error_code, uintptr_t addr)
+{
+    if (mm == NULL)
+    {
+        return -E_INVAL;
+    }
+
+    struct vma_struct *vma = find_vma(mm, addr);
+    if (vma == NULL || addr < vma->vm_start)
+    {
+        return -E_INVAL;
+    }
+
+    uintptr_t la = ROUNDDOWN(addr, PGSIZE);
+    pte_t *ptep = get_pte(mm->pgdir, la, 1);
+    if (ptep == NULL)
+    {
+        return -E_NO_MEM;
+    }
+
+    if (*ptep & PTE_V)
+    {
+        return 0;
+    }
+
+    uint32_t perm = PTE_U | PTE_V;
+    if (vma->vm_flags & VM_READ)
+    {
+        perm |= PTE_R;
+    }
+    if (vma->vm_flags & VM_WRITE)
+    {
+        perm |= PTE_R | PTE_W;
+    }
+    if (vma->vm_flags & VM_EXEC)
+    {
+        perm |= PTE_X;
+    }
+
+    struct Page *page = alloc_page();
+    if (page == NULL)
+    {
+        return -E_NO_MEM;
+    }
+    memset(page2kva(page), 0, PGSIZE);
+    int ret = page_insert(mm->pgdir, page, la, perm);
+    if (ret != 0)
+    {
+        free_page(page);
+        return ret;
+    }
+    page->pra_vaddr = la;
+    return 0;
+}
+
 bool copy_to_user(struct mm_struct *mm, void *dst, const void *src, size_t len)
 {
     if (!user_mem_check(mm, (uintptr_t)dst, len, 1))

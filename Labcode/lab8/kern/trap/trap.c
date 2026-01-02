@@ -199,11 +199,31 @@ void exception_handler(struct trapframe *tf)
         cprintf("Instruction page fault\n");
         break;
     case CAUSE_LOAD_PAGE_FAULT:
-        cprintf("Load page fault\n");
-        break;
     case CAUSE_STORE_PAGE_FAULT:
-        cprintf("Store/AMO page fault\n");
+    {
+        struct mm_struct *mm = (current != NULL) ? current->mm : NULL;
+        uintptr_t badaddr = tf->tval;
+        int ret = -E_INVAL;
+        if (mm != NULL)
+        {
+            ret = do_pgfault(mm, 0, badaddr);
+        }
+        if (ret != 0)
+        {
+            cprintf("Unhandled page fault @0x%lx, ret=%d\n", badaddr, ret);
+            print_trapframe(tf);
+            if (current != NULL && !trap_in_kernel(tf))
+            {
+                cprintf("killing pid %d\n", current->pid);
+                do_exit(-E_KILLED);
+            }
+            else
+            {
+                panic("kernel page fault\n");
+            }
+        }
         break;
+    }
     default:
         print_trapframe(tf);
         break;

@@ -600,7 +600,74 @@ sfs_io_nolock(struct sfs_fs *sfs, struct sfs_inode *sin, void *buf, off_t offset
 	 *       NOTICE: useful function: sfs_bmap_load_nolock, sfs_buf_op	
 	*/
 
+     // (1) 处理第一个块（可能不对齐）
+    blkoff = offset % SFS_BLKSIZE;  // ⭐ 先计算 blkoff
+    if (blkoff != 0) {
+        // 计算第一个块需要读写的字节数
+        size = (nblks != 0) ? (SFS_BLKSIZE - blkoff) : (endpos - offset);
+        
+        // 获取第一个块的物理块号
+        if ((ret = sfs_bmap_load_nolock(sfs, sin, blkno, &ino)) != 0) {
+            goto out;
+        }
+        
+        // 读写第一个块的部分内容
+        if ((ret = sfs_buf_op(sfs, buf, size, ino, blkoff)) != 0) {
+            goto out;
+        }
+        
+        // 更新已读写的字节数
+        alen += size;
+        
+        // 如果已经完成所有读写，跳转到结束
+        if (alen == endpos - offset) {
+            goto out;
+        }
+        
+        // 移动缓冲区指针，准备处理下一个块
+        buf += size;
+        blkno++;
+        nblks--;
+    }
     
+    // (2) 处理中间的完整块
+    size = SFS_BLKSIZE;
+    while (nblks != 0) {
+        // 获取当前块的物理块号
+        if ((ret = sfs_bmap_load_nolock(sfs, sin, blkno, &ino)) != 0) {
+            goto out;
+        }
+        
+        // 读写整个块
+        if ((ret = sfs_block_op(sfs, buf, ino, 1)) != 0) {
+            goto out;
+        }
+        
+        // 更新已读写的字节数
+        alen += size;
+        
+        // 移动缓冲区指针，准备处理下一个块
+        buf += size;
+        blkno++;
+        nblks--;
+    }
+    
+    // (3) 处理最后一个块（可能不对齐）
+    if ((size = endpos % SFS_BLKSIZE) != 0) {
+        // 获取最后一个块的物理块号
+        if ((ret = sfs_bmap_load_nolock(sfs, sin, blkno, &ino)) != 0) {
+            goto out;
+        }
+        
+        // 读写最后一个块的部分内容（从块开头开始）
+        if ((ret = sfs_buf_op(sfs, buf, size, ino, 0)) != 0) {
+            goto out;
+        }
+        
+        // 更新已读写的字节数
+        alen += size;
+    }
+   
 
 out:
     *alenp = alen;
