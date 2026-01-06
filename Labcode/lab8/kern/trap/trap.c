@@ -199,7 +199,8 @@ void exception_handler(struct trapframe *tf)
         cprintf("Instruction page fault\n");
         break;
     case CAUSE_LOAD_PAGE_FAULT:
-    case CAUSE_STORE_PAGE_FAULT:
+        cprintf("Load page fault\n");
+        case CAUSE_STORE_PAGE_FAULT:
     {
         struct mm_struct *mm = (current != NULL) ? current->mm : NULL;
         uintptr_t badaddr = tf->tval;

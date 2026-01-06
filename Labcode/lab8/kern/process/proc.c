@@ -1127,8 +1127,8 @@ int do_execve(const char *name, int argc, const char **argv)
         cprintf("do_execve: file_open failed, ret=%d\n", ret);  // ⭐ 添加
         goto execve_exit;
     }
-
-    cprintf("do_execve: file_open success, fd=%d\n", fd);  // ⭐ 添加
+    
+   cprintf("do_execve: file_open success, fd=%d\n", fd);  // ⭐ 添加
     
     if (mm != NULL)
     {
